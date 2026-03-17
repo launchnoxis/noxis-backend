@@ -54,10 +54,16 @@ async function buildLaunchTransaction({
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
   // Use Lightning API — handles signing and broadcasting server-side
+  // bs58 v5 CommonJS compatibility fix
+  const bs58Module = require('bs58');
+  const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
+  const mintSecretKeyEncoded = bs58Encode(Buffer.from(mintKeypair.secretKey));
+  console.log('[tokenLaunch] Mint secret key length:', mintSecretKeyEncoded.length);
+
   const body = {
     action: 'create',
     tokenMetadata: { name, symbol, uri: metadataUri },
-    mint: mintKeypair.publicKey.toBase58(),
+    mint: mintSecretKeyEncoded,
     denominatedInSol: 'true',
     amount: devBuySol > 0 ? devBuySol : 0.1,
     slippage: 10,
