@@ -8,7 +8,6 @@ const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
 
-  // Handle image
   if (imageUrl && imageUrl.startsWith('data:')) {
     const matches = imageUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
     if (matches) {
@@ -41,24 +40,19 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
     timeout: 30000,
   });
 
-  console.log('[tokenLaunch] IPFS response:', JSON.stringify(res.data));
   return res.data.metadataUri;
 }
 
 async function buildLaunchTransaction({
   creatorWallet, name, symbol, description, imageUrl,
-  twitter, telegram, website, devBuySol = 0, slippageBps = 500,
+  twitter, telegram, website, devBuySol = 1, slippageBps = 500,
 }) {
   const mintKeypair = Keypair.generate();
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  const amount = devBuySol >= 0.1 ? devBuySol : 0.1;
-
-  const bs58 = require('bs58');
-  const mintSecretKeyBase58 = bs58.encode(mintKeypair.secretKey);
-
+  // Match EXACTLY the PumpPortal JS docs example
   const body = {
     publicKey: creatorWallet,
     action: 'create',
@@ -67,18 +61,16 @@ async function buildLaunchTransaction({
       symbol: symbol,
       uri: metadataUri,
     },
-    mint: mintSecretKeyBase58,
+    mint: mintKeypair.publicKey.toBase58(),
     denominatedInSol: 'true',
-    amount: amount,
+    amount: devBuySol >= 1 ? devBuySol : 1,
     slippage: 10,
     priorityFee: 0.0005,
     pool: 'pump',
+    isMayhemMode: 'false',
   };
 
-  console.log('[tokenLaunch] Request to PumpPortal:', JSON.stringify({
-    ...body,
-    mint: body.mint.slice(0, 8) + '...',
-  }));
+  console.log('[tokenLaunch] Sending to PumpPortal:', JSON.stringify({ ...body, mint: body.mint.slice(0,8)+'...' }));
 
   const response = await fetch(PUMP_PORTAL_API, {
     method: 'POST',
@@ -86,20 +78,17 @@ async function buildLaunchTransaction({
     body: JSON.stringify(body),
   });
 
-  console.log('[tokenLaunch] PumpPortal status:', response.status);
+  const responseText = await response.text();
+  console.log('[tokenLaunch] PumpPortal status:', response.status, '| body:', responseText.slice(0, 200));
 
   if (!response.ok) {
-    const errText = await response.text();
-    console.error('[tokenLaunch] PumpPortal error body:', errText);
-    throw new Error(`PumpPortal error ${response.status}: ${errText}`);
+    throw new Error(`PumpPortal ${response.status}: ${responseText}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  const txBuffer = Buffer.from(arrayBuffer);
-  const base64Tx = txBuffer.toString('base64');
+  const txBuffer = Buffer.from(responseText, 'base64');
 
   return {
-    transaction: base64Tx,
+    transaction: txBuffer.toString('base64'),
     mintAddress: mintKeypair.publicKey.toBase58(),
     mintKeypairBytes: Array.from(mintKeypair.secretKey),
     metadataUri,
