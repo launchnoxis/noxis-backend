@@ -7,6 +7,7 @@
 const { Keypair } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
+const bs58 = require('bs58');
 
 const PUMP_PORTAL_API = 'https://pumpportal.fun/api/trade-local';
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
@@ -54,12 +55,10 @@ async function buildLaunchTransaction({
   twitter, telegram, website, devBuySol = 0, slippageBps = 500,
 }) {
   const mintKeypair = Keypair.generate();
-  const bs58 = require('bs58').default || require('bs58');
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // PumpPortal requires minimum 0.1 SOL dev buy
   const amount = devBuySol > 0.1 ? devBuySol : 0.1;
 
   const body = {
@@ -68,10 +67,11 @@ async function buildLaunchTransaction({
     tokenMetadata: { name, symbol, uri: metadataUri },
     mint: bs58.encode(mintKeypair.secretKey),
     denominatedInSol: 'true',
-    amount,
-    slippage: Math.floor(slippageBps / 100),
+    amount: amount,
+    slippage: 10,
     priorityFee: 0.0005,
     pool: 'pump',
+    isMayhemMode: 'false',
   };
 
   console.log('[tokenLaunch] Calling PumpPortal with publicKey:', creatorWallet);
