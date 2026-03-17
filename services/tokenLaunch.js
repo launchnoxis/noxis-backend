@@ -65,7 +65,7 @@ async function buildLaunchTransaction({
     publicKey: creatorWallet,
     action: 'create',
     tokenMetadata: { name, symbol, uri: metadataUri },
-    mint: bs58.encode(mintKeypair.secretKey),
+    mint: mintKeypair.publicKey.toBase58(),
     denominatedInSol: 'true',
     amount: amount,
     slippage: 10,
