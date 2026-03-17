@@ -56,7 +56,9 @@ async function buildLaunchTransaction({
 
   const amount = devBuySol >= 0.1 ? devBuySol : 0.1;
 
-  // PumpPortal create uses publicKey for mint (not secret key)
+  const bs58 = require('bs58');
+  const mintSecretKeyBase58 = bs58.encode(mintKeypair.secretKey);
+
   const body = {
     publicKey: creatorWallet,
     action: 'create',
@@ -65,7 +67,7 @@ async function buildLaunchTransaction({
       symbol: symbol,
       uri: metadataUri,
     },
-    mint: mintKeypair.publicKey.toBase58(),
+    mint: mintSecretKeyBase58,
     denominatedInSol: 'true',
     amount: amount,
     slippage: 10,
