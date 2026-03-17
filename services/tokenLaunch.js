@@ -84,8 +84,12 @@ async function buildLaunchTransaction({
       timeout: 30000,
     });
   } catch (err) {
-    const errText = err.response?.data ? Buffer.from(err.response.data).toString() : err.message;
-    console.error('[tokenLaunch] PumpPortal error:', errText);
+    let errText = err.message;
+    if (err.response?.data) {
+      errText = Buffer.from(err.response.data).toString();
+    }
+    console.error('[tokenLaunch] PumpPortal full error:', errText);
+    console.error('[tokenLaunch] Request body was:', JSON.stringify({ ...body, mint: body.mint?.slice(0,10) + '...' }));
     throw new Error(`PumpPortal error: ${errText}`);
   }
 
