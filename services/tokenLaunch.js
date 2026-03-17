@@ -2,8 +2,9 @@ const { Keypair } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
 
-const PUMP_PORTAL_API = 'https://pumpportal.fun/api/trade-local';
+const PUMP_LIGHTNING_API = 'https://pumpportal.fun/api/trade';
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
+const PUMP_API_KEY = process.env.PUMP_PORTAL_API_KEY;
 
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
@@ -45,54 +46,57 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
 
 async function buildLaunchTransaction({
   creatorWallet, name, symbol, description, imageUrl,
-  twitter, telegram, website, devBuySol = 1, slippageBps = 500,
+  twitter, telegram, website, devBuySol = 0.1, slippageBps = 500,
 }) {
   const mintKeypair = Keypair.generate();
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // Match EXACTLY the PumpPortal JS docs example
+  // Use Lightning API — handles signing and broadcasting server-side
   const body = {
-    publicKey: creatorWallet,
     action: 'create',
-    tokenMetadata: {
-      name: name,
-      symbol: symbol,
-      uri: metadataUri,
-    },
+    tokenMetadata: { name, symbol, uri: metadataUri },
     mint: mintKeypair.publicKey.toBase58(),
     denominatedInSol: 'true',
-    amount: devBuySol >= 1 ? devBuySol : 1,
+    amount: devBuySol > 0 ? devBuySol : 0.1,
     slippage: 10,
     priorityFee: 0.0005,
     pool: 'pump',
-    isMayhemMode: 'false',
   };
 
-  console.log('[tokenLaunch] Sending to PumpPortal:', JSON.stringify({ ...body, mint: body.mint.slice(0,8)+'...' }));
+  console.log('[tokenLaunch] Calling Lightning API for:', name, symbol);
 
-  const response = await fetch(PUMP_PORTAL_API, {
+  const response = await fetch(`${PUMP_LIGHTNING_API}?api-key=${PUMP_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
   const responseText = await response.text();
-  console.log('[tokenLaunch] PumpPortal status:', response.status, '| body:', responseText.slice(0, 200));
+  console.log('[tokenLaunch] Lightning API status:', response.status, '| body:', responseText.slice(0, 300));
 
   if (!response.ok) {
-    throw new Error(`PumpPortal ${response.status}: ${responseText}`);
+    throw new Error(`PumpPortal Lightning error ${response.status}: ${responseText}`);
   }
 
-  const txBuffer = Buffer.from(responseText, 'base64');
+  const data = JSON.parse(responseText);
+
+  if (!data.signature) {
+    throw new Error(`No signature returned: ${responseText}`);
+  }
+
+  console.log('[tokenLaunch] Token launched! Signature:', data.signature);
 
   return {
-    transaction: txBuffer.toString('base64'),
+    signature: data.signature,
     mintAddress: mintKeypair.publicKey.toBase58(),
-    mintKeypairBytes: Array.from(mintKeypair.secretKey),
     metadataUri,
-    isVersioned: true,
+    pumpFunUrl: `https://pump.fun/${mintKeypair.publicKey.toBase58()}`,
+    explorerUrl: `https://solscan.io/tx/${data.signature}`,
+    // No transaction to sign — Lightning API handles it all
+    transaction: null,
+    mintKeypairBytes: null,
   };
 }
 
