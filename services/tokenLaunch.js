@@ -54,6 +54,7 @@ async function buildLaunchTransaction({
   twitter, telegram, website, devBuySol = 0, slippageBps = 500,
 }) {
   const mintKeypair = Keypair.generate();
+  const bs58 = require('bs58');
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
@@ -62,7 +63,7 @@ async function buildLaunchTransaction({
     publicKey: creatorWallet,
     action: 'create',
     tokenMetadata: { name, symbol, uri: metadataUri },
-    mint: mintKeypair.publicKey.toBase58(),
+    mint: bs58.encode(mintKeypair.secretKey), // full keypair as base58
     denominatedInSol: 'true',
     amount: devBuySol > 0 ? devBuySol : 0.0001,
     slippage: Math.floor(slippageBps / 100),
@@ -70,14 +71,25 @@ async function buildLaunchTransaction({
     pool: 'pump',
   };
 
-  const res = await axios.post(PUMP_PORTAL_API, body, {
-    headers: { 'Content-Type': 'application/json' },
-    responseType: 'arraybuffer',
-    timeout: 30000,
-  });
+  console.log('[tokenLaunch] Calling PumpPortal with publicKey:', creatorWallet);
+
+  let res;
+  try {
+    res = await axios.post(PUMP_PORTAL_API, body, {
+      headers: { 'Content-Type': 'application/json' },
+      responseType: 'arraybuffer',
+      timeout: 30000,
+    });
+  } catch (err) {
+    const errText = err.response?.data ? Buffer.from(err.response.data).toString() : err.message;
+    console.error('[tokenLaunch] PumpPortal error:', errText);
+    throw new Error(`PumpPortal error: ${errText}`);
+  }
 
   if (res.status !== 200) {
-    throw new Error(`PumpPortal API error: ${res.statusText}`);
+    const errText = Buffer.from(res.data).toString();
+    console.error('[tokenLaunch] PumpPortal bad status:', res.status, errText);
+    throw new Error(`PumpPortal API error ${res.status}: ${errText}`);
   }
 
   const txBuffer = Buffer.from(res.data);
