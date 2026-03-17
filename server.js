@@ -15,7 +15,11 @@ const PORT = process.env.PORT || 3001;
 // ─── Security ────────────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: [
+    process.env.FRONTEND_URL,
+    'https://noxis-backend-production.up.railway.app',
+    /\.vercel\.app$/,
+  ],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
