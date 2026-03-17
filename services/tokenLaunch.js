@@ -54,18 +54,21 @@ async function buildLaunchTransaction({
   twitter, telegram, website, devBuySol = 0, slippageBps = 500,
 }) {
   const mintKeypair = Keypair.generate();
-  const bs58 = require('bs58');
+  const bs58 = require('bs58').default || require('bs58');
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
+
+  // PumpPortal requires minimum 0.1 SOL dev buy
+  const amount = devBuySol > 0.1 ? devBuySol : 0.1;
 
   const body = {
     publicKey: creatorWallet,
     action: 'create',
     tokenMetadata: { name, symbol, uri: metadataUri },
-    mint: bs58.encode(mintKeypair.secretKey), // full keypair as base58
+    mint: bs58.encode(mintKeypair.secretKey),
     denominatedInSol: 'true',
-    amount: devBuySol > 0 ? devBuySol : 0.0001,
+    amount,
     slippage: Math.floor(slippageBps / 100),
     priorityFee: 0.0005,
     pool: 'pump',
