@@ -1,13 +1,6 @@
-/**
- * tokenLaunch.js
- * Uses PumpPortal's official trade-local API to build the launch transaction.
- * Much more reliable than manually encoding pump.fun instructions.
- */
-
 const { Keypair } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
-const bs58 = require('bs58');
 
 const PUMP_PORTAL_API = 'https://pumpportal.fun/api/trade-local';
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
@@ -15,6 +8,7 @@ const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
 
+  // Handle image
   if (imageUrl && imageUrl.startsWith('data:')) {
     const matches = imageUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
     if (matches) {
@@ -47,6 +41,7 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
     timeout: 30000,
   });
 
+  console.log('[tokenLaunch] IPFS response:', JSON.stringify(res.data));
   return res.data.metadataUri;
 }
 
@@ -59,47 +54,46 @@ async function buildLaunchTransaction({
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  const amount = devBuySol > 0.1 ? devBuySol : 0.1;
+  const amount = devBuySol >= 0.1 ? devBuySol : 0.1;
 
+  // PumpPortal create uses publicKey for mint (not secret key)
   const body = {
     publicKey: creatorWallet,
     action: 'create',
-    tokenMetadata: { name, symbol, uri: metadataUri },
+    tokenMetadata: {
+      name: name,
+      symbol: symbol,
+      uri: metadataUri,
+    },
     mint: mintKeypair.publicKey.toBase58(),
     denominatedInSol: 'true',
     amount: amount,
     slippage: 10,
     priorityFee: 0.0005,
     pool: 'pump',
-    isMayhemMode: 'false',
   };
 
-  console.log('[tokenLaunch] Calling PumpPortal with publicKey:', creatorWallet);
+  console.log('[tokenLaunch] Request to PumpPortal:', JSON.stringify({
+    ...body,
+    mint: body.mint.slice(0, 8) + '...',
+  }));
 
-  let res;
-  try {
-    res = await axios.post(PUMP_PORTAL_API, body, {
-      headers: { 'Content-Type': 'application/json' },
-      responseType: 'arraybuffer',
-      timeout: 30000,
-    });
-  } catch (err) {
-    let errText = err.message;
-    if (err.response?.data) {
-      errText = Buffer.from(err.response.data).toString();
-    }
-    console.error('[tokenLaunch] PumpPortal full error:', errText);
-    console.error('[tokenLaunch] Request body was:', JSON.stringify({ ...body, mint: body.mint?.slice(0,10) + '...' }));
-    throw new Error(`PumpPortal error: ${errText}`);
+  const response = await fetch(PUMP_PORTAL_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  console.log('[tokenLaunch] PumpPortal status:', response.status);
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error('[tokenLaunch] PumpPortal error body:', errText);
+    throw new Error(`PumpPortal error ${response.status}: ${errText}`);
   }
 
-  if (res.status !== 200) {
-    const errText = Buffer.from(res.data).toString();
-    console.error('[tokenLaunch] PumpPortal bad status:', res.status, errText);
-    throw new Error(`PumpPortal API error ${res.status}: ${errText}`);
-  }
-
-  const txBuffer = Buffer.from(res.data);
+  const arrayBuffer = await response.arrayBuffer();
+  const txBuffer = Buffer.from(arrayBuffer);
   const base64Tx = txBuffer.toString('base64');
 
   return {
