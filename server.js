@@ -8,6 +8,7 @@ const tokenRoutes = require('./routes/token');
 const walletRoutes = require('./routes/wallet');
 const vestingRoutes = require('./routes/vesting');
 const boostRoutes = require('./routes/boost');
+const verifyRoutes = require('./routes/verify');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -43,6 +44,7 @@ app.use('/api/token', tokenRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/vesting', vestingRoutes);
 app.use('/api/boost', boostRoutes);
+app.use('/api/verify', verifyRoutes);
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
