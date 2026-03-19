@@ -18,7 +18,9 @@ app.use(helmet());
 app.use(cors({
   origin: [
     process.env.FRONTEND_URL,
-    'https://noxis-backend-production.up.railway.app',
+    'https://noxis-phi.vercel.app',
+    'https://noxis.fun',
+    'https://www.noxis.fun',
     /\.vercel\.app$/,
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
