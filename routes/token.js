@@ -1,6 +1,7 @@
 const express = require('express');
 const Joi = require('joi');
 const { buildLaunchTransaction } = require('../services/tokenLaunch');
+const { logLaunch } = require('../services/db');
 
 const router = express.Router();
 
@@ -72,6 +73,23 @@ router.post('/build', async (req, res, next) => {
     }
     console.log('[token/build] Building for wallet:', value.creatorWallet, 'token:', value.name);
     const result = await buildLaunchTransaction(value);
+
+    // Log to our database — never throws, won't affect launch
+    logLaunch({
+      mintAddress:   result.mintAddress,
+      creatorWallet: value.creatorWallet,
+      name:          value.name,
+      symbol:        value.symbol,
+      features: {
+        mintRenounced:   true,
+        freezeRenounced: true,
+        lpLocked:        value.lpLocked   ?? false,
+        devVesting:      value.devVesting ?? false,
+        lpLockDuration:  value.lpLockDuration || null,
+        vestingMonths:   value.vestingMonths  || null,
+      },
+    });
+
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('[token/build] Error:', err.message);
