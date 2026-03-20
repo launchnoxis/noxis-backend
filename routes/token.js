@@ -110,6 +110,8 @@ router.get('/launches/:wallet', (req, res) => {
     .sort((a, b) => new Date(b.launchedAt) - new Date(a.launchedAt));
   res.json({ launches });
 });
+
+router.get('/info/:mint', async (req, res, next) => {
   try {
     const axios = require('axios');
     const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${req.params.mint}`, { timeout: 5000 });
