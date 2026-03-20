@@ -53,12 +53,18 @@ async function buildLaunchTransaction({
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // Use Lightning API — handles signing and broadcasting server-side
-  // bs58 v5 CommonJS compatibility fix
+  // Encode mint keypair secret key for PumpPortal
+  // Must use the full 64-byte secret key as a Uint8Array
   const bs58Module = require('bs58');
   const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
-  const mintSecretKeyEncoded = bs58Encode(Buffer.from(mintKeypair.secretKey));
-  console.log('[tokenLaunch] Mint secret key length:', mintSecretKeyEncoded.length);
+  
+  // Ensure we have exactly 64 bytes
+  const secretKeyBytes = new Uint8Array(mintKeypair.secretKey);
+  if (secretKeyBytes.length !== 64) {
+    throw new Error(`Invalid secret key length: ${secretKeyBytes.length}, expected 64`);
+  }
+  const mintSecretKeyEncoded = bs58Encode(secretKeyBytes);
+  console.log('[tokenLaunch] Mint secret key length:', mintSecretKeyEncoded.length, '(should be 87-88)');
 
   const body = {
     action: 'create',
@@ -67,7 +73,7 @@ async function buildLaunchTransaction({
     denominatedInSol: 'true',
     amount: devBuySol > 0 ? devBuySol : 0.1,
     slippage: 10,
-    priorityFee: 0.0005,
+    priorityFee: 0.003,
     pool: 'pump',
   };
 
@@ -90,6 +96,34 @@ async function buildLaunchTransaction({
 
   if (!data.signature) {
     throw new Error(`No signature returned: ${responseText}`);
+  }
+
+  // Verify the transaction actually landed on-chain
+  const { Connection } = require('@solana/web3.js');
+  const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
+  
+  let confirmed = false;
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const status = await connection.getSignatureStatus(data.signature);
+      const conf = status?.value?.confirmationStatus;
+      console.log(`[tokenLaunch] Confirmation attempt ${i+1}: ${conf}`);
+      if (conf === 'confirmed' || conf === 'finalized') {
+        confirmed = true;
+        break;
+      }
+      if (status?.value?.err) {
+        throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.value.err)}`);
+      }
+    } catch (e) {
+      if (e.message.includes('Transaction failed')) throw e;
+      console.warn('[tokenLaunch] Confirmation check error:', e.message);
+    }
+  }
+
+  if (!confirmed) {
+    console.warn('[tokenLaunch] Could not confirm transaction — may still land');
   }
 
   console.log('[tokenLaunch] Token launched! Signature:', data.signature);
