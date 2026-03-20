@@ -140,9 +140,6 @@ function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTrad
   }
 
   const jobId = uuidv4();
-  const tradesPerDay = (24 * 60) / frequencyMinutes;
-  const solPerTrade = Math.min(dailySolTarget / tradesPerDay, maxTradeSol);
-
   const job = {
     jobId,
     mintAddress,
@@ -150,7 +147,7 @@ function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTrad
     dailySolTarget,
     frequencyMinutes,
     maxTradeSol,
-    solPerTrade,
+    solPerTrade: maxTradeSol, // use maxTradeSol directly — daily target is just for display
     status: 'active',
     tradesExecuted: 0,
     cycleCount: 0,
