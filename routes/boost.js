@@ -19,6 +19,7 @@ router.post('/volume/start', (req, res) => {
       dailySolTarget:    Joi.number().min(1).max(500).required(),
       frequencyMinutes:  Joi.number().min(1).max(60).default(2),
       maxTradeSol:       Joi.number().min(0.01).max(10).default(0.5),
+      userWallets:       Joi.array().items(Joi.string()).max(5).default([]),
     }).validate(req.body);
 
     if (error) return res.status(400).json({ error: error.details[0].message });
