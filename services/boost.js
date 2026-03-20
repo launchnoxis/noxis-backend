@@ -184,6 +184,26 @@ function stopVolumeJob(jobId) {
   if (!job) return { error: 'Job not found' };
   if (job._cron) job._cron.stop();
   job.status = 'stopped';
+
+  // Sell all remaining positions across all sub-wallets
+  if (SUB_WALLETS.length > 0) {
+    console.log(`[boost] Job ${jobId} stopped — selling all positions...`);
+    Promise.all(SUB_WALLETS.map(async wallet => {
+      try {
+        const sig = await executeTrade({
+          wallet,
+          mintAddress: job.mintAddress,
+          action: 'sell',
+          solAmount: '100%',
+        });
+        console.log(`[boost] Sell-all wallet ${wallet.index}: ${sig.slice(0, 20)}...`);
+      } catch (e) {
+        // Wallet may have no tokens — that's fine
+        console.log(`[boost] Sell-all wallet ${wallet.index} skipped: ${e.message.slice(0, 60)}`);
+      }
+    })).catch(() => {});
+  }
+
   return { jobId, status: 'stopped' };
 }
 
