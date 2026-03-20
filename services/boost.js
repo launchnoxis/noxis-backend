@@ -38,39 +38,50 @@ const SUB_WALLETS = loadSubWallets();
 const activeJobs = new Map();
 const jobHistory = new Map();
 
-// ─── Execute one trade via PumpPortal ───────────────────────────────────────
+// ─── Execute one trade via trade-local + sub-wallet signing ─────────────────
 async function executeTrade({ wallet, mintAddress, action, solAmount }) {
-  const bs58Module = require('bs58');
-  const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
-  const walletPrivKey = bs58Encode(new Uint8Array(wallet.keypair.secretKey));
+  const { Connection, VersionedTransaction } = require('@solana/web3.js');
+  const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
 
   const body = {
-    action: action, // 'buy' or 'sell'
+    publicKey: wallet.pubKey,
+    action,
     mint: mintAddress,
-    amount: action === 'buy' ? solAmount : '100%', // sell 100% of holdings
+    amount: action === 'buy' ? solAmount : '100%',
     denominatedInSol: action === 'buy' ? 'true' : 'false',
     slippage: 15,
     priorityFee: 0.003,
     pool: 'pump',
   };
 
-  const response = await fetch(`${PUMP_PORTAL_API}?api-key=${PUMP_API_KEY}`, {
+  // trade-local returns an unsigned transaction
+  const response = await fetch('https://pumpportal.fun/api/trade-local', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'wallet-private-key': walletPrivKey,
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
-  const text = await response.text();
-  const data = JSON.parse(text);
-
-  if (!response.ok || !data.signature) {
-    throw new Error(`Trade failed: ${text.slice(0, 200)}`);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`trade-local failed ${response.status}: ${text.slice(0, 200)}`);
   }
 
-  return data.signature;
+  // Response is raw transaction bytes
+  const txBytes = await response.arrayBuffer();
+  const tx = VersionedTransaction.deserialize(new Uint8Array(txBytes));
+
+  // Sign with sub-wallet keypair
+  tx.sign([wallet.keypair]);
+
+  // Submit to Solana
+  const signature = await connection.sendTransaction(tx, { skipPreflight: true });
+  console.log(`[boost] Submitted ${action} tx: ${signature.slice(0, 20)}...`);
+
+  // Wait for confirmation
+  const { value } = await connection.confirmTransaction(signature, 'confirmed');
+  if (value?.err) throw new Error(`Transaction failed: ${JSON.stringify(value.err)}`);
+
+  return signature;
 }
 
 // ─── Execute one buy/sell cycle ─────────────────────────────────────────────
@@ -164,7 +175,7 @@ function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTrad
   activeJobs.set(jobId, job);
   jobHistory.set(jobId, []);
 
-  console.log(`[boost] Job ${jobId} started — ${mintAddress} — ${solPerTrade.toFixed(4)} SOL/trade every ${frequencyMinutes}min`);
+  console.log(`[boost] Job ${jobId} started — ${mintAddress} — ${maxTradeSol.toFixed(4)} SOL/trade every ${frequencyMinutes}min`);
   return { jobId, ...sanitizeJob(job) };
 }
 
