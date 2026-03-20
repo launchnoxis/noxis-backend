@@ -16,6 +16,7 @@ const launchSchema = Joi.object({
   website: Joi.string().allow('').default(''),
   devBuySol: Joi.number().min(0).max(10).default(1),
   slippageBps: Joi.number().min(100).max(5000).default(500),
+  mintSecretKey: Joi.string().allow('').optional(),
 });
 
 // Test endpoint - call this to debug PumpPortal directly
