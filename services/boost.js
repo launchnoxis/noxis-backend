@@ -1,43 +1,144 @@
 /**
- * boost.js
- * Volume & holder growth engine.
- *
- * IMPORTANT: Volume bots operate in a grey area on pump.fun.
- * This implementation is provided for educational/research purposes.
- * Ensure compliance with pump.fun ToS before deploying to production.
- *
- * Architecture:
- *  - Jobs are stored in memory (use Redis/DB in production)
- *  - cron schedules periodic buy/sell txs
- *  - Each cycle uses a fresh sub-wallet derived from a provided seed
+ * boost.js — Real volume engine using 3 funded sub-wallets
+ * Buy/sell cycles via PumpPortal Lightning API
  */
 
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
-const {
-  PublicKey,
-  Transaction,
-  SystemProgram,
-  LAMPORTS_PER_SOL,
-  Keypair,
-  TransactionInstruction,
-} = require('@solana/web3.js');
-const {
-  getConnection,
-  getRecentBlockhash,
-  PUMP_FUN_PROGRAM_ID,
-  PUMP_FUN_GLOBAL,
-  PUMP_FUN_FEE_RECIPIENT,
-} = require('./solana');
+const { Keypair } = require('@solana/web3.js');
 
-// In-memory job store (replace with Redis/Postgres in prod)
+const PUMP_PORTAL_API = 'https://pumpportal.fun/api/trade';
+const PUMP_API_KEY = process.env.PUMP_PORTAL_API_KEY;
+
+// ─── Load sub-wallets from env ─────────────────────────────────────────────
+function loadSubWallets() {
+  const wallets = [];
+  const bs58Module = require('bs58');
+  const bs58Decode = bs58Module.decode || bs58Module.default?.decode || bs58Module.default;
+
+  for (let i = 1; i <= 3; i++) {
+    const privKey = process.env[`BOOST_WALLET_${i}_PRIVKEY`];
+    const pubKey  = process.env[`BOOST_WALLET_${i}_PUBKEY`];
+    if (privKey && pubKey) {
+      try {
+        const keypair = Keypair.fromSecretKey(bs58Decode(privKey));
+        wallets.push({ keypair, pubKey: keypair.publicKey.toBase58(), index: i });
+        console.log(`[boost] Loaded sub-wallet ${i}: ${keypair.publicKey.toBase58().slice(0,8)}...`);
+      } catch (e) {
+        console.warn(`[boost] Failed to load sub-wallet ${i}:`, e.message);
+      }
+    }
+  }
+  return wallets;
+}
+
+const SUB_WALLETS = loadSubWallets();
+
+// ─── Job store ──────────────────────────────────────────────────────────────
 const activeJobs = new Map();
 const jobHistory = new Map();
 
-/**
- * Start a volume boost job
- */
+// ─── Execute one trade via PumpPortal ───────────────────────────────────────
+async function executeTrade({ wallet, mintAddress, action, solAmount }) {
+  const bs58Module = require('bs58');
+  const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
+  const walletPrivKey = bs58Encode(new Uint8Array(wallet.keypair.secretKey));
+
+  const body = {
+    action: action, // 'buy' or 'sell'
+    mint: mintAddress,
+    amount: action === 'buy' ? solAmount : '100%', // sell 100% of holdings
+    denominatedInSol: action === 'buy' ? 'true' : 'false',
+    slippage: 15,
+    priorityFee: 0.003,
+    pool: 'pump',
+  };
+
+  const response = await fetch(`${PUMP_PORTAL_API}?api-key=${PUMP_API_KEY}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'wallet-private-key': walletPrivKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  const data = JSON.parse(text);
+
+  if (!response.ok || !data.signature) {
+    throw new Error(`Trade failed: ${text.slice(0, 200)}`);
+  }
+
+  return data.signature;
+}
+
+// ─── Execute one buy/sell cycle ─────────────────────────────────────────────
+async function executeCycle(job) {
+  if (SUB_WALLETS.length === 0) {
+    console.warn('[boost] No sub-wallets configured — add BOOST_WALLET_1_PRIVKEY etc to Railway');
+    job.errors++;
+    return;
+  }
+
+  try {
+    // Pick a random sub-wallet
+    const wallet = SUB_WALLETS[Math.floor(Math.random() * SUB_WALLETS.length)];
+
+    // Add ±20% variance to trade amount
+    const variance = 0.8 + Math.random() * 0.4;
+    const tradeAmount = parseFloat((job.solPerTrade * variance).toFixed(4));
+
+    const isBuy = job.cycleCount % 2 === 0;
+    const action = isBuy ? 'buy' : 'sell';
+
+    console.log(`[boost] ${job.jobId} ${action.toUpperCase()} ${tradeAmount} SOL via wallet ${wallet.index}`);
+
+    const signature = await executeTrade({
+      wallet,
+      mintAddress: job.mintAddress,
+      action,
+      solAmount: tradeAmount,
+    });
+
+    job.cycleCount++;
+    job.tradesExecuted++;
+    job.lastTradeAt = Date.now();
+    if (isBuy) job.totalVolumeSol += tradeAmount;
+
+    const record = {
+      ts: Date.now(),
+      action,
+      amountSol: tradeAmount,
+      wallet: wallet.pubKey.slice(0, 8) + '...',
+      signature,
+      status: 'success',
+    };
+
+    const history = jobHistory.get(job.jobId) || [];
+    history.push(record);
+    jobHistory.set(job.jobId, history.slice(-50));
+
+    console.log(`[boost] ${job.jobId} ${action} success: ${signature.slice(0, 20)}...`);
+  } catch (err) {
+    job.errors++;
+    console.error(`[boost] ${job.jobId} cycle error:`, err.message);
+    const history = jobHistory.get(job.jobId) || [];
+    history.push({ ts: Date.now(), status: 'error', error: err.message });
+    jobHistory.set(job.jobId, history.slice(-50));
+    if (job.errors > 10) {
+      console.warn(`[boost] ${job.jobId} too many errors, stopping job`);
+      stopVolumeJob(job.jobId);
+    }
+  }
+}
+
+// ─── Start job ───────────────────────────────────────────────────────────────
 function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTradeSol, ownerWallet }) {
+  if (SUB_WALLETS.length === 0) {
+    throw new Error('No boost sub-wallets configured on backend. Add BOOST_WALLET_1_PRIVKEY, BOOST_WALLET_2_PRIVKEY, BOOST_WALLET_3_PRIVKEY to Railway environment variables.');
+  }
+
   const jobId = uuidv4();
   const tradesPerDay = (24 * 60) / frequencyMinutes;
   const solPerTrade = Math.min(dailySolTarget / tradesPerDay, maxTradeSol);
@@ -52,112 +153,48 @@ function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTrad
     solPerTrade,
     status: 'active',
     tradesExecuted: 0,
+    cycleCount: 0,
     totalVolumeSol: 0,
     startedAt: Date.now(),
     lastTradeAt: null,
     errors: 0,
   };
 
-  // Schedule cron: every N minutes
   const cronExpr = `*/${Math.max(1, Math.floor(frequencyMinutes))} * * * *`;
-
-  const cronJob = cron.schedule(cronExpr, async () => {
-    await executeTradeCycle(job);
-  });
-
+  const cronJob = cron.schedule(cronExpr, () => executeCycle(job));
   job._cron = cronJob;
+
   activeJobs.set(jobId, job);
   jobHistory.set(jobId, []);
 
-  console.log(`[boost] Volume job ${jobId} started for mint ${mintAddress}`);
+  console.log(`[boost] Job ${jobId} started — ${mintAddress} — ${solPerTrade.toFixed(4)} SOL/trade every ${frequencyMinutes}min`);
   return { jobId, ...sanitizeJob(job) };
 }
 
-/**
- * Stop a volume job
- */
 function stopVolumeJob(jobId) {
   const job = activeJobs.get(jobId);
   if (!job) return { error: 'Job not found' };
   if (job._cron) job._cron.stop();
   job.status = 'stopped';
-  activeJobs.set(jobId, job);
   return { jobId, status: 'stopped' };
 }
 
-/**
- * Get job status
- */
 function getJobStatus(jobId) {
   const job = activeJobs.get(jobId);
   if (!job) return null;
-  return {
-    ...sanitizeJob(job),
-    history: (jobHistory.get(jobId) || []).slice(-20), // last 20 trades
-  };
+  return { ...sanitizeJob(job), history: (jobHistory.get(jobId) || []).slice(-20) };
 }
 
-/**
- * List all jobs for a wallet
- */
 function listJobs(ownerWallet) {
   const jobs = [];
   for (const [, job] of activeJobs) {
-    if (!ownerWallet || job.ownerWallet === ownerWallet) {
-      jobs.push(sanitizeJob(job));
-    }
+    if (!ownerWallet || job.ownerWallet === ownerWallet) jobs.push(sanitizeJob(job));
   }
   return jobs;
 }
 
-/**
- * Execute one buy/sell cycle for a job
- * NOTE: In production, this needs funded sub-wallets.
- * Here we log the intended action and return a transaction for the owner to sign.
- */
-async function executeTradeCycle(job) {
-  try {
-    const isBuy = job.tradesExecuted % 2 === 0; // alternate buy/sell
-    const action = isBuy ? 'BUY' : 'SELL';
-    const randomVariance = 0.8 + Math.random() * 0.4; // ±20% variance
-    const tradeAmount = job.solPerTrade * randomVariance;
-
-    // Log trade intent
-    const tradeRecord = {
-      ts: Date.now(),
-      action,
-      amountSol: parseFloat(tradeAmount.toFixed(4)),
-      status: 'pending',
-      txSignature: null,
-    };
-
-    job.tradesExecuted++;
-    job.lastTradeAt = Date.now();
-
-    // In a fully automated setup, you'd:
-    // 1. Load a funded sub-wallet keypair from secure storage
-    // 2. Build + sign + send the pump.fun buy/sell tx
-    // 3. Update tradeRecord.status and txSignature
-    // For now, we simulate and record the intent.
-    tradeRecord.status = 'simulated';
-    tradeRecord.note = 'Fund sub-wallets to enable fully automatic execution';
-
-    if (isBuy) {
-      job.totalVolumeSol += tradeAmount;
-    }
-
-    const history = jobHistory.get(job.jobId) || [];
-    history.push(tradeRecord);
-    jobHistory.set(job.jobId, history);
-
-    console.log(`[boost] ${job.jobId} ${action} ~${tradeAmount.toFixed(3)} SOL`);
-  } catch (err) {
-    job.errors++;
-    console.error(`[boost] Job ${job.jobId} error:`, err.message);
-    if (job.errors > 10) {
-      stopVolumeJob(job.jobId);
-    }
-  }
+function getSubWallets() {
+  return SUB_WALLETS.map(w => ({ index: w.index, pubKey: w.pubKey }));
 }
 
 function sanitizeJob(job) {
@@ -165,67 +202,4 @@ function sanitizeJob(job) {
   return safe;
 }
 
-/**
- * Build a single manual buy transaction for the boost engine
- * (used when owner wants to execute a specific trade manually)
- */
-async function buildBoostBuyTransaction({ buyerWallet, mintAddress, solAmount, slippageBps = 1000 }) {
-  const buyer = new PublicKey(buyerWallet);
-  const mint = new PublicKey(mintAddress);
-  const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
-  const { getBondingCurvePDA } = require('./solana');
-
-  const bondingCurvePDA = await getBondingCurvePDA(mint);
-  const buyerATA = await getAssociatedTokenAddress(mint, buyer);
-
-  const lamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
-  const maxCost = lamports + (lamports * BigInt(slippageBps)) / BigInt(10000);
-  const estimatedTokens = BigInt(Math.floor((solAmount / 0.000000028) * 0.85));
-
-  const discriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
-  const amountBuf = Buffer.alloc(8);
-  amountBuf.writeBigUInt64LE(estimatedTokens);
-  const maxCostBuf = Buffer.alloc(8);
-  maxCostBuf.writeBigUInt64LE(maxCost);
-  const buyData = Buffer.concat([discriminator, amountBuf, maxCostBuf]);
-
-  const PUMP_EVENT_AUTHORITY = new PublicKey('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1');
-  const TOKEN_PROGRAM_ID = require('@solana/spl-token').TOKEN_PROGRAM_ID;
-
-  const { blockhash, lastValidBlockHeight } = await getRecentBlockhash();
-  const tx = new Transaction({ recentBlockhash: blockhash, feePayer: buyer });
-
-  tx.add(createAssociatedTokenAccountInstruction(buyer, buyerATA, buyer, mint));
-  tx.add(
-    new TransactionInstruction({
-      programId: PUMP_FUN_PROGRAM_ID,
-      keys: [
-        { pubkey: PUMP_FUN_GLOBAL, isSigner: false, isWritable: false },
-        { pubkey: PUMP_FUN_FEE_RECIPIENT, isSigner: false, isWritable: true },
-        { pubkey: mint, isSigner: false, isWritable: false },
-        { pubkey: bondingCurvePDA, isSigner: false, isWritable: true },
-        { pubkey: buyerATA, isSigner: false, isWritable: true },
-        { pubkey: buyer, isSigner: true, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: new PublicKey('SysvarRent111111111111111111111111111111111'), isSigner: false, isWritable: false },
-        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-        { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },
-      ],
-      data: buyData,
-    })
-  );
-
-  return {
-    transaction: tx.serialize({ requireAllSignatures: false }).toString('base64'),
-    lastValidBlockHeight,
-  };
-}
-
-module.exports = {
-  startVolumeJob,
-  stopVolumeJob,
-  getJobStatus,
-  listJobs,
-  buildBoostBuyTransaction,
-};
+module.exports = { startVolumeJob, stopVolumeJob, getJobStatus, listJobs, getSubWallets };
