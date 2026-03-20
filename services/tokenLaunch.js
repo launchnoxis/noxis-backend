@@ -47,17 +47,29 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
 async function buildLaunchTransaction({
   creatorWallet, name, symbol, description, imageUrl,
   twitter, telegram, website, devBuySol = 0.1, slippageBps = 500,
+  mintSecretKey, // optional: pre-generated bs58 secret key from frontend
 }) {
-  const mintKeypair = Keypair.generate();
+  const bs58Module = require('bs58');
+  const bs58Decode = bs58Module.decode || bs58Module.default?.decode || bs58Module.default;
+  const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
+
+  // Use pre-generated keypair if provided, otherwise generate new one
+  let mintKeypair;
+  if (mintSecretKey) {
+    try {
+      mintKeypair = Keypair.fromSecretKey(bs58Decode(mintSecretKey));
+      console.log('[tokenLaunch] Using pre-generated mint:', mintKeypair.publicKey.toBase58());
+    } catch(e) {
+      console.warn('[tokenLaunch] Invalid mintSecretKey, generating new one:', e.message);
+      mintKeypair = Keypair.generate();
+    }
+  } else {
+    mintKeypair = Keypair.generate();
+  }
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // Encode mint keypair secret key for PumpPortal
-  // Must use the full 64-byte secret key as a Uint8Array
-  const bs58Module = require('bs58');
-  const bs58Encode = bs58Module.encode || bs58Module.default?.encode || bs58Module.default;
-  
   // Ensure we have exactly 64 bytes
   const secretKeyBytes = new Uint8Array(mintKeypair.secretKey);
   if (secretKeyBytes.length !== 64) {
