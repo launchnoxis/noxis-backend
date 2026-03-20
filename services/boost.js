@@ -86,15 +86,16 @@ async function executeTrade({ wallet, mintAddress, action, solAmount }) {
 
 // ─── Execute one buy/sell cycle ─────────────────────────────────────────────
 async function executeCycle(job) {
-  if (SUB_WALLETS.length === 0) {
-    console.warn('[boost] No sub-wallets configured — add BOOST_WALLET_1_PRIVKEY etc to Railway');
+  const wallets = job._wallets || SUB_WALLETS;
+  if (wallets.length === 0) {
+    console.warn('[boost] No wallets available for job');
     job.errors++;
     return;
   }
 
   try {
-    // Pick a random sub-wallet
-    const wallet = SUB_WALLETS[Math.floor(Math.random() * SUB_WALLETS.length)];
+    // Pick a random wallet
+    const wallet = wallets[Math.floor(Math.random() * wallets.length)];
 
     // Add ±20% variance to trade amount
     const variance = 0.8 + Math.random() * 0.4;
@@ -145,9 +146,27 @@ async function executeCycle(job) {
 }
 
 // ─── Start job ───────────────────────────────────────────────────────────────
-function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTradeSol, ownerWallet }) {
-  if (SUB_WALLETS.length === 0) {
-    throw new Error('No boost sub-wallets configured on backend. Add BOOST_WALLET_1_PRIVKEY, BOOST_WALLET_2_PRIVKEY, BOOST_WALLET_3_PRIVKEY to Railway environment variables.');
+function startVolumeJob({ mintAddress, dailySolTarget, frequencyMinutes, maxTradeSol, ownerWallet, userWallets }) {
+  // userWallets: array of bs58 private keys passed from frontend (never stored)
+  let walletsToUse = SUB_WALLETS;
+
+  if (userWallets && userWallets.length > 0) {
+    const bs58Module = require('bs58');
+    const bs58Decode = bs58Module.decode || bs58Module.default?.decode || bs58Module.default;
+    walletsToUse = [];
+    for (let i = 0; i < userWallets.length; i++) {
+      try {
+        const keypair = require('@solana/web3.js').Keypair.fromSecretKey(bs58Decode(userWallets[i]));
+        walletsToUse.push({ keypair, pubKey: keypair.publicKey.toBase58(), index: i + 1 });
+        console.log(`[boost] User wallet ${i+1} loaded: ${keypair.publicKey.toBase58().slice(0,8)}...`);
+      } catch(e) {
+        throw new Error(`Invalid private key for wallet ${i+1}: ${e.message}`);
+      }
+    }
+  }
+
+  if (walletsToUse.length === 0) {
+    throw new Error('No wallets available. Either configure backend sub-wallets or import your own.');
   }
 
   const jobId = uuidv4();
@@ -186,9 +205,10 @@ function stopVolumeJob(jobId) {
   job.status = 'stopped';
 
   // Sell all remaining positions across all sub-wallets
-  if (SUB_WALLETS.length > 0) {
+  const wallets = job._wallets || SUB_WALLETS;
+  if (wallets.length > 0) {
     console.log(`[boost] Job ${jobId} stopped — selling all positions...`);
-    Promise.all(SUB_WALLETS.map(async wallet => {
+    Promise.all(wallets.map(async wallet => {
       try {
         const sig = await executeTrade({
           wallet,
@@ -226,7 +246,7 @@ function getSubWallets() {
 }
 
 function sanitizeJob(job) {
-  const { _cron, ...safe } = job;
+  const { _cron, _wallets, ...safe } = job;
   return safe;
 }
 
