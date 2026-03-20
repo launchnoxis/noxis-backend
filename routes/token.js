@@ -101,7 +101,15 @@ router.post('/submit', async (req, res) => {
   res.json({ success: true, message: 'Transaction submitted via frontend' });
 });
 
-router.get('/info/:mint', async (req, res, next) => {
+// GET /api/token/launches/:wallet — get all tokens launched by this wallet via Noxis
+router.get('/launches/:wallet', (req, res) => {
+  const { getAllLaunches } = require('../services/db');
+  const all = getAllLaunches();
+  const launches = Object.values(all)
+    .filter(l => l.creatorWallet === req.params.wallet)
+    .sort((a, b) => new Date(b.launchedAt) - new Date(a.launchedAt));
+  res.json({ launches });
+});
   try {
     const axios = require('axios');
     const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${req.params.mint}`, { timeout: 5000 });
