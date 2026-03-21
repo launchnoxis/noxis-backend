@@ -1,9 +1,10 @@
-const { Keypair, VersionedTransaction, Connection } = require('@solana/web3.js');
+const { Keypair } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
 
-const PUMP_LOCAL_API = 'https://pumpportal.fun/api/trade-local';
+const PUMP_LIGHTNING_API = 'https://pumpportal.fun/api/trade';
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
+const PUMP_API_KEY = process.env.PUMP_PORTAL_API_KEY;
 
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
@@ -46,7 +47,7 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
 async function buildLaunchTransaction({
   creatorWallet, name, symbol, description, imageUrl,
   twitter, telegram, website, devBuySol = 0.1,
-  mintSecretKey, // pre-generated bs58 secret key from frontend
+  mintSecretKey,
 }) {
   const bs58Module = require('bs58');
   const bs58Decode = bs58Module.decode || bs58Module.default?.decode || bs58Module.default;
@@ -66,17 +67,20 @@ async function buildLaunchTransaction({
     mintKeypair = Keypair.generate();
   }
 
-  // Upload metadata to IPFS
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // Call trade-local — returns unsigned transaction bytes
-  // User's wallet (creatorWallet) pays gas and dev buy
+  const secretKeyBytes = new Uint8Array(mintKeypair.secretKey);
+  if (secretKeyBytes.length !== 64) {
+    throw new Error(`Invalid secret key length: ${secretKeyBytes.length}, expected 64`);
+  }
+  const mintSecretKeyEncoded = bs58Encode(secretKeyBytes);
+  console.log('[tokenLaunch] Mint pubkey:', mintKeypair.publicKey.toBase58());
+
   const body = {
-    publicKey: creatorWallet,
     action: 'create',
     tokenMetadata: { name, symbol, uri: metadataUri },
-    mint: mintKeypair.publicKey.toBase58(), // public key only for trade-local
+    mint: mintSecretKeyEncoded,
     denominatedInSol: 'true',
     amount: devBuySol > 0 ? devBuySol : 0.1,
     slippage: 10,
@@ -84,36 +88,54 @@ async function buildLaunchTransaction({
     pool: 'pump',
   };
 
-  console.log('[tokenLaunch] Calling trade-local for:', name, symbol);
+  console.log('[tokenLaunch] Calling Lightning API for:', name, symbol);
 
-  const response = await fetch(PUMP_LOCAL_API, {
+  const response = await fetch(`${PUMP_LIGHTNING_API}?api-key=${PUMP_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
+  const responseText = await response.text();
+  console.log('[tokenLaunch] Lightning API status:', response.status, '| body:', responseText.slice(0, 300));
+
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`PumpPortal trade-local error ${response.status}: ${text.slice(0, 300)}`);
+    throw new Error(`PumpPortal Lightning error ${response.status}: ${responseText}`);
   }
 
-  // Response is raw transaction bytes
-  const txBytes = await response.arrayBuffer();
-  const tx = VersionedTransaction.deserialize(new Uint8Array(txBytes));
+  const data = JSON.parse(responseText);
 
-  // Sign with mint keypair (required — mint must co-sign token creation)
-  tx.sign([mintKeypair]);
+  if (!data.signature) {
+    throw new Error(`No signature returned: ${responseText}`);
+  }
 
-  // Return partially-signed transaction for frontend wallet to sign + submit
-  const txBase64 = Buffer.from(tx.serialize()).toString('base64');
-  console.log('[tokenLaunch] Transaction built, awaiting user signature for:', mintKeypair.publicKey.toBase58());
+  // Verify transaction landed on-chain
+  const { Connection } = require('@solana/web3.js');
+  const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
+
+  let confirmed = false;
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const status = await connection.getSignatureStatus(data.signature);
+      const conf = status?.value?.confirmationStatus;
+      console.log(`[tokenLaunch] Confirmation attempt ${i+1}: ${conf}`);
+      if (conf === 'confirmed' || conf === 'finalized') { confirmed = true; break; }
+      if (status?.value?.err) throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.value.err)}`);
+    } catch (e) {
+      if (e.message.includes('Transaction failed')) throw e;
+    }
+  }
+
+  if (!confirmed) console.warn('[tokenLaunch] Could not confirm — may still land');
+  console.log('[tokenLaunch] Token launched! Signature:', data.signature);
 
   return {
-    transaction: txBase64,           // frontend signs this with user wallet
+    signature: data.signature,
     mintAddress: mintKeypair.publicKey.toBase58(),
     metadataUri,
     pumpFunUrl: `https://pump.fun/${mintKeypair.publicKey.toBase58()}`,
-    signature: null,                 // filled in after frontend submits
+    explorerUrl: `https://solscan.io/tx/${data.signature}`,
   };
 }
 
