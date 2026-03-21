@@ -1,8 +1,8 @@
-const { Keypair } = require('@solana/web3.js');
+const { Keypair, VersionedTransaction } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
 
-const PUMP_CREATE_LOCAL = 'https://pumpportal.fun/api/create-local';
+const PUMP_TRADE_LOCAL = 'https://pumpportal.fun/api/trade-local';
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
 
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
@@ -51,7 +51,7 @@ async function buildLaunchTransaction({
   const bs58Module = require('bs58');
   const bs58Decode = bs58Module.decode || bs58Module.default?.decode || bs58Module.default;
 
-  // Use pre-generated keypair if provided, otherwise generate new one
+  // Use pre-generated keypair if provided
   let mintKeypair;
   if (mintSecretKey) {
     try {
@@ -65,26 +65,30 @@ async function buildLaunchTransaction({
     mintKeypair = Keypair.generate();
   }
 
-  // Upload metadata
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
 
-  // Call create-local — correct endpoint for token creation
-  // Returns unsigned transaction that user's wallet + mint keypair must sign
+  // trade-local with action: 'create' — returns base58 encoded transaction
   const body = {
-    publicKey: creatorWallet,           // user's wallet — pays fees, gets dev tokens
-    mint: mintKeypair.publicKey.toBase58(), // mint public key only
-    tokenMetadata: { name, symbol, uri: metadataUri },
+    publicKey: creatorWallet,
+    action: 'create',
+    tokenMetadata: {
+      name,
+      symbol,
+      uri: metadataUri,
+    },
+    mint: mintKeypair.publicKey.toBase58(),
     denominatedInSol: 'true',
     amount: devBuySol > 0 ? devBuySol : 0.1,
     slippage: 10,
     priorityFee: 0.003,
     pool: 'pump',
+    isMayhemMode: 'false',
   };
 
-  console.log('[tokenLaunch] Calling create-local, mint:', mintKeypair.publicKey.toBase58());
+  console.log('[tokenLaunch] Calling trade-local create for:', name, symbol);
 
-  const response = await fetch(PUMP_CREATE_LOCAL, {
+  const response = await fetch(PUMP_TRADE_LOCAL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -92,21 +96,20 @@ async function buildLaunchTransaction({
 
   if (!response.ok) {
     const text = await response.text();
-    console.error('[tokenLaunch] create-local error:', text);
-    throw new Error(`PumpPortal create-local error ${response.status}: ${text.slice(0, 300)}`);
+    console.error('[tokenLaunch] trade-local error:', text.slice(0, 300));
+    throw new Error(`PumpPortal trade-local error ${response.status}: ${text.slice(0, 200)}`);
   }
 
-  // Response is raw transaction bytes — need BOTH mint keypair + user wallet to sign
-  const { VersionedTransaction } = require('@solana/web3.js');
+  // Response is raw binary transaction bytes
   const txBytes = await response.arrayBuffer();
   const tx = VersionedTransaction.deserialize(new Uint8Array(txBytes));
 
-  // Sign with mint keypair (backend handles this)
+  // Sign with mint keypair (backend)
+  // User's wallet will sign on the frontend
   tx.sign([mintKeypair]);
 
-  // Return partially signed tx — frontend will sign with user wallet + submit
   const txBase64 = Buffer.from(tx.serialize()).toString('base64');
-  console.log('[tokenLaunch] Built tx, mint:', mintKeypair.publicKey.toBase58(), '— awaiting user signature');
+  console.log('[tokenLaunch] Built tx for mint:', mintKeypair.publicKey.toBase58());
 
   return {
     transaction: txBase64,
