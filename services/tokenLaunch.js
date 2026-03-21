@@ -67,6 +67,7 @@ async function buildLaunchTransaction({
 
   const metadataUri = await uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website });
   console.log('[tokenLaunch] Metadata URI:', metadataUri);
+  if (!metadataUri) throw new Error('Failed to get metadata URI from IPFS');
 
   // trade-local with action: 'create' — returns base58 encoded transaction
   const body = {
@@ -86,7 +87,11 @@ async function buildLaunchTransaction({
     isMayhemMode: 'false',
   };
 
-  console.log('[tokenLaunch] Calling trade-local create for:', name, symbol);
+  console.log('[tokenLaunch] Request body:', JSON.stringify({
+    ...body,
+    publicKey: body.publicKey.slice(0,8) + '...',
+    mint: body.mint.slice(0,8) + '...',
+  }));
 
   const response = await fetch(PUMP_TRADE_LOCAL, {
     method: 'POST',
@@ -96,7 +101,7 @@ async function buildLaunchTransaction({
 
   if (!response.ok) {
     const text = await response.text();
-    console.error('[tokenLaunch] trade-local error:', text.slice(0, 300));
+    console.error('[tokenLaunch] trade-local full error:', text);
     throw new Error(`PumpPortal trade-local error ${response.status}: ${text.slice(0, 200)}`);
   }
 
