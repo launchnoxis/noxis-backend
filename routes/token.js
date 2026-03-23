@@ -1,7 +1,7 @@
 const express = require('express');
 const Joi = require('joi');
 const { buildLaunchTransaction } = require('../services/tokenLaunch');
-const { buildLocalLaunchTransaction } = require('../services/tokenLaunchLocal');
+const { buildLocalLaunchTransaction, buildBuyTransaction } = require('../services/tokenLaunchLocal');
 const { logLaunch } = require('../services/db');
 
 const router = express.Router();
@@ -33,7 +33,14 @@ const localLaunchSchema = Joi.object({
   slippageBps:   Joi.number().min(100).max(5000).default(500),
 });
 
-// NEW: Local launch - user wallet signs and pays
+const buySchema = Joi.object({
+  userPublicKey: Joi.string().min(32).max(44).required(),
+  mint:          Joi.string().min(32).max(44).required(),
+  amountSol:     Joi.number().min(0.001).max(10).required(),
+  slippageBps:   Joi.number().min(100).max(5000).default(500),
+});
+
+// Local launch - user wallet signs and pays (create only, amount=0)
 router.post('/build-local', async (req, res, next) => {
   try {
     const { error, value } = localLaunchSchema.validate(req.body);
@@ -41,19 +48,22 @@ router.post('/build-local', async (req, res, next) => {
       console.error('[token/build-local] Validation error:', error.details[0].message);
       return res.status(400).json({ error: error.details[0].message });
     }
+
     console.log('[token/build-local] Building local tx for wallet:', value.userPublicKey, 'token:', value.name);
+
     const result = await buildLocalLaunchTransaction({
       userPublicKey: value.userPublicKey,
-      name: value.name,
-      symbol: value.symbol,
-      description: value.description,
-      imageUrl: value.imageUrl,
-      twitter: value.twitter,
-      telegram: value.telegram,
-      website: value.website,
-      devBuySol: value.devBuySol,
-      slippageBps: value.slippageBps,
+      name:          value.name,
+      symbol:        value.symbol,
+      description:   value.description,
+      imageUrl:      value.imageUrl,
+      twitter:       value.twitter,
+      telegram:      value.telegram,
+      website:       value.website,
+      devBuySol:     value.devBuySol,
+      slippageBps:   value.slippageBps,
     });
+
     logLaunch({
       mintAddress: result.mintAddress,
       creatorWallet: value.userPublicKey,
@@ -61,15 +71,14 @@ router.post('/build-local', async (req, res, next) => {
       symbol: value.symbol,
       features: { mintRenounced: true, freezeRenounced: true, localSigning: true },
     });
+
     console.log('[token/build-local] Success! Mint:', result.mintAddress);
+
     res.json({
       success: true,
       transaction: result.transaction,
       mintAddress: result.mintAddress,
       metadataUri: result.metadataUri,
-      devBuyAmount: result.devBuyAmount,
-      balanceWarning: result.balanceWarning || null,
-      devBuyTransaction: result.devBuyTransaction || null,
     });
   } catch (err) {
     console.error('[token/build-local] Error:', err.message);
@@ -77,7 +86,37 @@ router.post('/build-local', async (req, res, next) => {
   }
 });
 
-// Test endpoint (fixed: removed isMayhemMode)
+// NEW: Build a buy transaction for an existing token (called after create tx confirms)
+router.post('/build-buy', async (req, res, next) => {
+  try {
+    const { error, value } = buySchema.validate(req.body);
+    if (error) {
+      console.error('[token/build-buy] Validation error:', error.details[0].message);
+      return res.status(400).json({ success: false, error: error.details[0].message });
+    }
+
+    console.log('[token/build-buy] Building buy tx for wallet:', value.userPublicKey, 'mint:', value.mint, 'amount:', value.amountSol, 'SOL');
+
+    const result = await buildBuyTransaction({
+      userPublicKey: value.userPublicKey,
+      mint:          value.mint,
+      amountSol:     value.amountSol,
+      slippageBps:   value.slippageBps,
+    });
+
+    console.log('[token/build-buy] Success! Buy tx built for', value.amountSol, 'SOL');
+
+    res.json({
+      success: true,
+      transaction: result.transaction,
+    });
+  } catch (err) {
+    console.error('[token/build-buy] Error:', err.message);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Test endpoint
 router.get('/test-pumpportal', async (req, res) => {
   try {
     const { Keypair } = require('@solana/web3.js');
@@ -125,9 +164,12 @@ router.post('/build', async (req, res, next) => {
       name: value.name,
       symbol: value.symbol,
       features: {
-        mintRenounced: true, freezeRenounced: true,
-        lpLocked: value.lpLocked ?? false, devVesting: value.devVesting ?? false,
-        lpLockDuration: value.lpLockDuration || null, vestingMonths: value.vestingMonths || null,
+        mintRenounced: true,
+        freezeRenounced: true,
+        lpLocked: value.lpLocked ?? false,
+        devVesting: value.devVesting ?? false,
+        lpLockDuration: value.lpLockDuration || null,
+        vestingMonths: value.vestingMonths || null,
       },
     });
     res.json({ success: true, ...result });
