@@ -2,10 +2,15 @@
  * services/tokenLaunchLocal.js
  * Token launch via PumpPortal trade-local API.
  * The USER's wallet signs and pays - they become the creator.
- * 
+ *
  * IMPORTANT: PumpPortal trade-local "create" action does NOT support
  * amount > 0 (dev buy in same tx). It crashes with toBuffer() error.
- * So we do: create (amount=0) + separate buy tx for dev buy.
+ *
+ * Flow:
+ *   1. buildLocalLaunchTransaction() - creates token (amount=0)
+ *   2. Frontend signs & sends create tx, waits for on-chain confirmation
+ *   3. buildBuyTransaction() - builds a separate buy tx (token now exists on bonding curve)
+ *   4. Frontend signs & sends buy tx
  */
 
 const { Keypair, VersionedTransaction, Connection } = require('@solana/web3.js');
@@ -18,9 +23,8 @@ const HELIUS_RPC = 'https://mainnet.helius-rpc.com/?api-key=' + (process.env.HEL
 
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
-
   if (imageUrl && imageUrl.startsWith('data:')) {
-    const matches = imageUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    const matches = imageUrl.match(/^data:([A-Za-z-+\\/]+);base64,(.+)$/);
     if (matches) {
       const buffer = Buffer.from(matches[2], 'base64');
       const ext = matches[1].split('/')[1] || 'png';
@@ -36,7 +40,6 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
       console.warn('[tokenLaunchLocal] Could not fetch image:', e.message);
     }
   }
-
   formData.append('name', name);
   formData.append('symbol', symbol);
   formData.append('description', description || '');
@@ -44,12 +47,10 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
   if (telegram) formData.append('telegram', telegram);
   if (website) formData.append('website', website);
   formData.append('showName', 'true');
-
   const res = await axios.post(PUMP_IPFS_API, formData, {
     headers: formData.getHeaders(),
     timeout: 30000
   });
-
   const metadataUri = res.data.metadataUri;
   const metadata = res.data.metadata || {};
   if (!metadataUri) throw new Error('IPFS upload failed: ' + JSON.stringify(res.data));
@@ -72,6 +73,10 @@ async function callTradeLocal(requestBody) {
   return { ok: true, data: response.data };
 }
 
+/**
+ * Build the CREATE transaction only (amount=0).
+ * Returns the partially-signed tx (signed by mint keypair) for the user wallet to co-sign.
+ */
 async function buildLocalLaunchTransaction({
   userPublicKey, name, symbol, description, imageUrl,
   twitter, telegram, website, devBuySol = 0, slippageBps = 500,
@@ -80,13 +85,11 @@ async function buildLocalLaunchTransaction({
   const mintAddress = mintKeypair.publicKey.toBase58();
   console.log('[tokenLaunchLocal] Generated mint:', mintAddress);
 
-  // Upload metadata to IPFS
   const { metadataUri, metadata } = await uploadToPumpIpfs({
     name, symbol, description, imageUrl, twitter, telegram, website
   });
 
-  // Step 1: Build CREATE transaction (always amount=0)
-  // PumpPortal trade-local "create" does NOT support amount > 0
+  // Build CREATE transaction (always amount=0, dev buy is separate after confirmation)
   const createBody = {
     publicKey: userPublicKey,
     action: 'create',
@@ -108,48 +111,46 @@ async function buildLocalLaunchTransaction({
     throw new Error('PumpPortal create failed (' + createResult.status + '): ' + createResult.error);
   }
 
-  // Deserialize and partially sign create tx with mint keypair
   const createTx = VersionedTransaction.deserialize(new Uint8Array(createResult.data));
   createTx.sign([mintKeypair]);
   console.log('[tokenLaunchLocal] Create tx partially signed with mint keypair');
 
-  const result = {
+  return {
     transaction: Buffer.from(createTx.serialize()).toString('base64'),
     mintAddress,
     metadataUri,
-    devBuyAmount: 0,
-    devBuyTransaction: null,
-    balanceWarning: null
   };
-
-  // Step 2: If dev buy requested, build a separate BUY transaction
-  if (devBuySol > 0) {
-    console.log('[tokenLaunchLocal] Building dev buy tx for', devBuySol, 'SOL');
-    const buyBody = {
-      publicKey: userPublicKey,
-      action: 'buy',
-      mint: mintAddress,
-      denominatedInSol: 'true',
-      amount: devBuySol,
-      slippage: Math.round(slippageBps / 100),
-      priorityFee: 0.0005,
-      pool: 'pump'
-    };
-
-    const buyResult = await callTradeLocal(buyBody);
-    if (buyResult.ok) {
-      const buyTx = VersionedTransaction.deserialize(new Uint8Array(buyResult.data));
-      // Buy tx does NOT need mint keypair signing - only user wallet
-      result.devBuyTransaction = Buffer.from(buyTx.serialize()).toString('base64');
-      result.devBuyAmount = devBuySol;
-      console.log('[tokenLaunchLocal] Dev buy tx built successfully');
-    } else {
-      console.warn('[tokenLaunchLocal] Dev buy tx failed:', buyResult.error);
-      result.balanceWarning = 'Token will be created but dev buy of ' + devBuySol + ' SOL could not be prepared. You can buy manually after creation.';
-    }
-  }
-
-  return result;
 }
 
-module.exports = { buildLocalLaunchTransaction };
+/**
+ * Build a BUY transaction for an existing token on the bonding curve.
+ * This must be called AFTER the create tx is confirmed on-chain.
+ */
+async function buildBuyTransaction({ userPublicKey, mint, amountSol, slippageBps = 500 }) {
+  console.log('[tokenLaunchLocal] Building buy tx for', amountSol, 'SOL on mint:', mint);
+
+  const buyBody = {
+    publicKey: userPublicKey,
+    action: 'buy',
+    mint: mint,
+    denominatedInSol: 'true',
+    amount: amountSol,
+    slippage: Math.round(slippageBps / 100),
+    priorityFee: 0.0005,
+    pool: 'pump'
+  };
+
+  const buyResult = await callTradeLocal(buyBody);
+  if (!buyResult.ok) {
+    throw new Error('PumpPortal buy failed (' + buyResult.status + '): ' + buyResult.error);
+  }
+
+  const buyTx = VersionedTransaction.deserialize(new Uint8Array(buyResult.data));
+  console.log('[tokenLaunchLocal] Buy tx built successfully');
+
+  return {
+    transaction: Buffer.from(buyTx.serialize()).toString('base64'),
+  };
+}
+
+module.exports = { buildLocalLaunchTransaction, buildBuyTransaction };
