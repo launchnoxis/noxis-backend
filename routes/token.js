@@ -69,6 +69,7 @@ router.post('/build-local', async (req, res, next) => {
       metadataUri: result.metadataUri,
       devBuyAmount: result.devBuyAmount,
       balanceWarning: result.balanceWarning || null,
+      devBuyTransaction: result.devBuyTransaction || null,
     });
   } catch (err) {
     console.error('[token/build-local] Error:', err.message);
