@@ -4,12 +4,25 @@
  * The USER's wallet signs and pays - they become the creator.
  */
 
-const { Keypair, VersionedTransaction } = require('@solana/web3.js');
+const { Keypair, VersionedTransaction, Connection } = require('@solana/web3.js');
 const axios = require('axios');
 const FormData = require('form-data');
 
 const PUMP_IPFS_API = 'https://pump.fun/api/ipfs';
 const PUMP_LOCAL_API = 'https://pumpportal.fun/api/trade-local';
+const HELIUS_RPC = 'https://mainnet.helius-rpc.com/?api-key=' + (process.env.HELIUS_API_KEY || 'df6e4ab9-4411-414a-93e7-1ef173635b18');
+const MIN_SOL_FOR_CREATE = 0.05; // ~0.02 creation fee + rent + tx fees buffer
+
+async function getWalletBalance(publicKey) {
+  try {
+    const conn = new Connection(HELIUS_RPC, 'confirmed');
+    const balance = await conn.getBalance(new (require('@solana/web3.js').PublicKey)(publicKey));
+    return balance / 1e9; // lamports to SOL
+  } catch (e) {
+    console.warn('[tokenLaunchLocal] Could not check balance:', e.message);
+    return null;
+  }
+}
 
 async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, telegram, website }) {
   const formData = new FormData();
@@ -46,39 +59,66 @@ async function uploadToPumpIpfs({ name, symbol, description, imageUrl, twitter, 
     timeout: 30000,
   });
 
-  // Return the full response so we can use metadata.name and metadata.symbol
   const metadataUri = res.data.metadataUri;
   const metadata = res.data.metadata || {};
-  if (!metadataUri) throw new Error('IPFS upload unexpected format: ' + JSON.stringify(res.data));
+  if (!metadataUri) throw new Error('IPFS upload failed: ' + JSON.stringify(res.data));
 
-  console.log('[tokenLaunchLocal] IPFS metadata URI:', metadataUri);
-  console.log('[tokenLaunchLocal] IPFS metadata:', JSON.stringify(metadata));
-
+  console.log('[tokenLaunchLocal] IPFS URI:', metadataUri);
   return { metadataUri, metadata };
 }
-async function buildLocalLaunchTransaction({
-  userPublicKey,
-  name,
-  symbol,
-  description,
-  imageUrl,
-  twitter,
-  telegram,
-  website,
-  devBuySol = 0,
-  slippageBps = 500,
-}) {
-  // Generate mint keypair
-  const mintKeypair = Keypair.generate();
-  console.log('[tokenLaunchLocal] Generated mint:', mintKeypair.publicKey.toBase58());
+async function callTradeLocal(requestBody) {
+  console.log('[tokenLaunchLocal] Calling trade-local:', JSON.stringify(requestBody, null, 2));
 
-  // Upload metadata to IPFS via pump.fun
+  const response = await axios.post(PUMP_LOCAL_API, requestBody, {
+    headers: { 'Content-Type': 'application/json' },
+    responseType: 'arraybuffer',
+    timeout: 30000,
+    validateStatus: () => true,
+  });
+
+  if (response.status !== 200) {
+    const errorText = Buffer.from(response.data).toString('utf-8');
+    console.error('[tokenLaunchLocal] PumpPortal', response.status, errorText);
+    return { ok: false, status: response.status, error: errorText };
+  }
+  return { ok: true, data: response.data };
+}
+
+async function buildLocalLaunchTransaction({
+  userPublicKey, name, symbol, description, imageUrl,
+  twitter, telegram, website, devBuySol = 0, slippageBps = 500,
+}) {
+  const mintKeypair = Keypair.generate();
+  const mintAddress = mintKeypair.publicKey.toBase58();
+  console.log('[tokenLaunchLocal] Generated mint:', mintAddress);
+
+  // Check wallet balance
+  const balance = await getWalletBalance(userPublicKey);
+  console.log('[tokenLaunchLocal] Wallet balance:', balance, 'SOL');
+
+  let effectiveDevBuy = devBuySol;
+  let balanceWarning = null;
+
+  if (balance !== null) {
+    const maxDevBuy = Math.max(0, balance - MIN_SOL_FOR_CREATE);
+    if (devBuySol > maxDevBuy) {
+      console.warn('[tokenLaunchLocal] Wallet has', balance, 'SOL, max dev buy ~', maxDevBuy.toFixed(4));
+      if (maxDevBuy < 0.001) {
+        effectiveDevBuy = 0;
+        balanceWarning = 'Wallet has ' + balance.toFixed(4) + ' SOL. Creating token without dev buy (need more SOL for dev buy).';
+      } else {
+        effectiveDevBuy = Math.floor(maxDevBuy * 100) / 100;
+        balanceWarning = 'Dev buy reduced to ' + effectiveDevBuy + ' SOL (wallet has ' + balance.toFixed(4) + ' SOL).';
+      }
+    }
+  }
+
+  // Upload metadata to IPFS
   const { metadataUri, metadata } = await uploadToPumpIpfs({
     name, symbol, description, imageUrl, twitter, telegram, website
   });
 
-  // Build request body EXACTLY matching PumpPortal docs
-  // Use metadata.name and metadata.symbol from IPFS response (as shown in official examples)
+  // Build request body matching PumpPortal docs exactly
   const requestBody = {
     publicKey: userPublicKey,
     action: 'create',
@@ -87,51 +127,41 @@ async function buildLocalLaunchTransaction({
       symbol: metadata.symbol || symbol,
       uri: metadataUri
     },
-    mint: mintKeypair.publicKey.toBase58(),
+    mint: mintAddress,
     denominatedInSol: 'true',
-    amount: devBuySol > 0 ? devBuySol : 1,
+    amount: effectiveDevBuy,
     slippage: Math.round(slippageBps / 100),
     priorityFee: 0.0005,
     pool: 'pump'
   };
 
-  console.log('[tokenLaunchLocal] Calling trade-local with body:', JSON.stringify(requestBody, null, 2));
+  // First attempt with dev buy
+  let result = await callTradeLocal(requestBody);
 
-  // Use axios instead of fetch for reliable server-to-server HTTP
-  let response;
-  try {
-    response = await axios.post(PUMP_LOCAL_API, requestBody, {
-      headers: { 'Content-Type': 'application/json' },
-      responseType: 'arraybuffer',
-      timeout: 30000,
-      validateStatus: () => true, // don't throw on non-2xx so we can log the error
-    });
-  } catch (netErr) {
-    console.error('[tokenLaunchLocal] Network error calling PumpPortal:', netErr.message);
-    throw new Error('Network error calling PumpPortal: ' + netErr.message);
+  // If 400 and had dev buy, retry without dev buy
+  if (!result.ok && result.status === 400 && effectiveDevBuy > 0) {
+    console.warn('[tokenLaunchLocal] Retrying with amount=0 (likely insufficient funds for dev buy)');
+    requestBody.amount = 0;
+    balanceWarning = 'Dev buy of ' + effectiveDevBuy + ' SOL failed (insufficient funds). Token created without dev buy.';
+    effectiveDevBuy = 0;
+    result = await callTradeLocal(requestBody);
   }
 
-  console.log('[tokenLaunchLocal] PumpPortal response status:', response.status);
-  console.log('[tokenLaunchLocal] PumpPortal response headers:', JSON.stringify(response.headers));
-
-  if (response.status !== 200) {
-    const errorText = Buffer.from(response.data).toString('utf-8');
-    console.error('[tokenLaunchLocal] PumpPortal error body:', errorText);
-    console.error('[tokenLaunchLocal] Request was:', JSON.stringify(requestBody, null, 2));
-    throw new Error('PumpPortal trade-local failed (' + response.status + '): ' + errorText);
+  if (!result.ok) {
+    throw new Error('PumpPortal trade-local failed (' + result.status + '): ' + result.error);
   }
 
   // Deserialize and partially sign with mint keypair
-  const tx = VersionedTransaction.deserialize(new Uint8Array(response.data));
+  const tx = VersionedTransaction.deserialize(new Uint8Array(result.data));
   tx.sign([mintKeypair]);
   console.log('[tokenLaunchLocal] Partially signed with mint keypair');
 
-  const serializedTx = Buffer.from(tx.serialize()).toString('base64');
-
   return {
-    transaction: serializedTx,
-    mintAddress: mintKeypair.publicKey.toBase58(),
-    metadataUri
+    transaction: Buffer.from(tx.serialize()).toString('base64'),
+    mintAddress,
+    metadataUri,
+    devBuyAmount: effectiveDevBuy,
+    balanceWarning
   };
 }
 
